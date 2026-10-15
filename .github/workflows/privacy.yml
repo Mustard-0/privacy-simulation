@@ -1,0 +1,135 @@
+name: Privacy CPU Matrix
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        type: choice
+        description: Execution stage
+        options: [screen, formal_training]
+        default: screen
+      gate_run:
+        type: string
+        description: Passing screen run ID for formal work
+        default: ''
+      resume_run:
+        type: string
+        description: Prior same-stage run ID
+        default: ''
+      max_parallel:
+        type: choice
+        description: Independent CPU machines
+        options: ['4', '2']
+        default: '4'
+      approved_minutes:
+        type: number
+        description: Aggregate runtime bound, not spending permission
+        default: 600
+permissions:
+  contents: write
+concurrency:
+  group: privacy-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  PYTHONUNBUFFERED: '1'
+  MPLBACKEND: Agg
+  OMP_NUM_THREADS: '2'
+  MKL_NUM_THREADS: '2'
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  STAGE: ${{ inputs.stage }}
+  TAG: privacy-run-${{ github.run_id }}
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      timeout: ${{ steps.plan.outputs.timeout }}
+      seconds: ${{ steps.plan.outputs.seconds }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11.9'}
+      - if: inputs.stage == 'formal_training'
+        env: {GATE_RUN: '${{ inputs.gate_run }}'}
+        run: gh release download "privacy-run-$GATE_RUN" --pattern screen_gate.json --dir review
+      - id: plan
+        env:
+          APPROVED_MINUTES: ${{ inputs.approved_minutes }}
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+          RESUME_RUN: ${{ inputs.resume_run }}
+          GATE_RUN: ${{ inputs.gate_run }}
+        run: python workflow_plan.py
+      - run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --target "$GITHUB_SHA" --title "$STAGE $GITHUB_RUN_ID" --notes 'Versioned simulated benchmark outputs and reproducibility evidence; one training seed; conditional batch accounting.' --prerelease
+  cells:
+    needs: plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout) }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11.9'}
+      - run: |
+          python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+      - if: inputs.stage == 'formal_training'
+        env: {GATE_RUN: '${{ inputs.gate_run }}'}
+        run: gh release download "privacy-run-$GATE_RUN" --pattern screen_gate.json --dir review
+      - if: inputs.resume_run != ''
+        env:
+          RESUME_RUN: ${{ inputs.resume_run }}
+          CELL: ${{ matrix.id }}
+        run: |
+          gh release download "privacy-run-$RESUME_RUN" --pattern "privacy-$STAGE-$CELL.tar.gz" --dir .restore
+          python archives.py extract ".restore/privacy-$STAGE-$CELL.tar.gz"
+      - env:
+          CELL: ${{ matrix.id }}
+          SECONDS_LIMIT: ${{ needs.plan.outputs.seconds }}
+        run: |
+          extra=()
+          if [[ "$STAGE" != screen ]]; then extra+=(--gate review/screen_gate.json); fi
+          python cloud.py run --stage "$STAGE" --job "$CELL" --device cpu --max-seconds "$SECONDS_LIMIT" "${extra[@]}"
+      - if: always()
+        env: {CELL: '${{ matrix.id }}'}
+        run: |
+          if [[ -d runs ]]; then
+            python archives.py pack "privacy-$STAGE-$CELL.tar.gz"
+            gh release upload "$TAG" "privacy-$STAGE-$CELL.tar.gz" --clobber
+          fi
+  review:
+    needs: [plan, cells]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11.9'}
+      - run: |
+          python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+      - run: |
+          mkdir -p .collect
+          gh release download "$TAG" --pattern "privacy-$STAGE-*.tar.gz" --dir .collect || true
+          for archive in .collect/*.tar.gz; do
+            if [[ -f "$archive" ]]; then python archives.py extract "$archive"; fi
+          done
+      - if: inputs.stage == 'formal_training'
+        env: {GATE_RUN: '${{ inputs.gate_run }}'}
+        run: gh release download "privacy-run-$GATE_RUN" --pattern screen_gate.json --dir review
+      - run: python workflow_review.py
+      - if: always()
+        run: |
+          if [[ -d runs ]]; then
+            python archives.py review review.tar.gz
+            gh release upload "$TAG" review.tar.gz --clobber
+          fi
+          if [[ -f runs/screen_gate.json ]]; then gh release upload "$TAG" runs/screen_gate.json --clobber; fi

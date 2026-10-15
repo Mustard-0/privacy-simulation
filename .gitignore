@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+runs/
+review/
+*.pt
+*.log
+origin_pipeline.json
+*.zip
+*.token
+.env*
+.test_tmp/
+benchmarks/
+*.tar.gz
+.restore/
+.collect/
